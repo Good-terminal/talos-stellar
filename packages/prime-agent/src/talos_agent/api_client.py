@@ -8,15 +8,54 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from opentelemetry.trace import SpanKind
 
 from talos_agent import metrics
 from talos_agent.config import Settings
-from talos_agent.http import RetryableHTTPError, request_with_retry
+from talos_agent.http import (
+    ResponseTooLargeError,
+    RetryableHTTPError,
+    request_with_retry,
+)
 from talos_agent.tracing import inject_trace_headers, traced_span
-from opentelemetry.trace import SpanKind
 
 _NO_KEY = object()
 _MAX_PAGINATION_PAGES = 1_000
+
+
+def _check_response_size(response: httpx.Response, limit_bytes: int) -> None:
+    """Raise ResponseTooLargeError when the response body exceeds *limit_bytes*.
+
+    The check is performed in two stages to fail as early as possible:
+
+    1. **Content-Length header** — if the server declared a body size that
+       already exceeds the limit, reject before reading a single byte.
+    2. **Actual body size** — after the body is buffered by httpx, measure
+       ``len(response.content)`` as the authoritative byte count.
+
+    Privacy contract: neither the response body nor any header values are
+    included in the error.  Only the URL path, measured size, and limit are
+    recorded so that secrets, seeds, payment proofs, and media cannot leak.
+    """
+    try:
+        url = str(response.request.url)
+    except RuntimeError:
+        url = str(response.url)
+
+    # Stage 1: fast-reject on declared Content-Length.
+    content_length_header = response.headers.get("content-length")
+    if content_length_header is not None:
+        try:
+            declared = int(content_length_header)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > limit_bytes:
+            raise ResponseTooLargeError(url, declared, limit_bytes)
+
+    # Stage 2: measure the buffered body (authoritative).
+    actual = len(response.content)
+    if actual > limit_bytes:
+        raise ResponseTooLargeError(url, actual, limit_bytes)
 
 
 class PaginationError(ValueError):
@@ -43,6 +82,10 @@ class TalosAPIClient:
             timeout=30.0,
         )
         self._settings = settings
+        max_bytes = getattr(settings, "api_client_response_max_bytes", None)
+        self._response_max_bytes: int = (
+            max_bytes if isinstance(max_bytes, int) and not isinstance(max_bytes, bool) else 1_048_576
+        )
 
     def _request_headers(self, supplied: dict[str, str] | None = None) -> dict[str, str]:
         """Capture one credential for the complete retry lifecycle of a request."""
@@ -87,6 +130,7 @@ class TalosAPIClient:
 
                 response = await request_with_retry(_do_send)
                 status_code = response.status_code
+                _check_response_size(response, self._response_max_bytes)
                 span.set_attribute("http.response.status_code", status_code)
                 span.set_attribute("http.retry.count", max(0, retry_count - 1))
                 return response
@@ -101,7 +145,9 @@ class TalosAPIClient:
                 )
 
     async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.get(url, **kwargs), provider="talos_web_api")
+        response = await request_with_retry(lambda: self._client.get(url, **kwargs), provider="talos_web_api")
+        _check_response_size(response, self._response_max_bytes)
+        return response
 
     async def _post(self, url: str, **kwargs: Any) -> httpx.Response:
         idempotency_key = kwargs.pop("idempotency_key", _NO_KEY)
@@ -109,13 +155,21 @@ class TalosAPIClient:
             headers = dict(kwargs.pop("headers", {}) or {})
             headers["Idempotency-Key"] = str(idempotency_key)
             kwargs["headers"] = headers
-        return await request_with_retry(lambda: self._client.post(url, **kwargs), provider="talos_web_api")
+        response = await request_with_retry(lambda: self._client.post(url, **kwargs), provider="talos_web_api")
+        _check_response_size(response, self._response_max_bytes)
+        return response
 
     async def _put(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.put(url, **kwargs), provider="talos_web_api")
+        response = await request_with_retry(lambda: self._client.put(url, **kwargs), provider="talos_web_api")
+        _check_response_size(response, self._response_max_bytes)
+        return response
 
     async def _patch(self, url: str, **kwargs: Any) -> httpx.Response:
-        return await request_with_retry(lambda: self._client.patch(url, **kwargs), provider="talos_web_api")
+        # Strip idempotency_key if callers pass it (fire-and-forget pattern).
+        kwargs.pop("idempotency_key", None)
+        response = await request_with_retry(lambda: self._client.patch(url, **kwargs), provider="talos_web_api")
+        _check_response_size(response, self._response_max_bytes)
+        return response
 
     async def _get_cursor_page(
         self,
@@ -392,7 +446,7 @@ class TalosAPIClient:
         params = {}
         if service_type:
             params["type"] = service_type
-        return await self._get(f"/api/talos/{talos_id}/service", params=params)
+        return await self._get(f"/api/talos/{talos_id}/service", params=params, timeout=self._a2a_timeout)
 
     async def submit_commerce(
         self,
@@ -408,6 +462,7 @@ class TalosAPIClient:
             json={"payload": payload},
             headers={"X-PAYMENT": payment_header},
             idempotency_key=idempotency_key,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()
@@ -523,7 +578,7 @@ class TalosAPIClient:
     # ── Jobs ───────────────────────────────────────────────
 
     async def get_pending_jobs(self) -> list[dict]:
-        r = await self._get("/api/jobs/pending")
+        r = await self._get("/api/jobs/pending", timeout=self._a2a_timeout)
         if r.status_code == 200:
             data = r.json()
             return data if isinstance(data, list) else data.get("jobs", [])
@@ -535,6 +590,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/claim",
             json={"ttlSeconds": ttl_seconds},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -545,6 +601,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/heartbeat",
             json={"fencingToken": fencing_token},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -573,6 +630,7 @@ class TalosAPIClient:
             f"/api/jobs/{job_id}/result",
             json={"result": result, "fencingToken": fencing_token},
             headers=headers,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()
@@ -656,3 +714,20 @@ class TalosAPIClient:
     def set_request_id(self, request_id: str) -> None:
         """Propagate cycle_id as X-Request-Id to web API calls."""
         self._client.headers["x-request-id"] = request_id
+
+    # ── A2A Timeout ────────────────────────────────────────
+
+    @property
+    def _a2a_timeout(self) -> httpx.Timeout:
+        """Build an httpx.Timeout from the four A2A timeout settings.
+
+        Returns a fresh Timeout each call so callers always get a value that
+        reflects the current settings, and the property remains free of
+        mutable cached state.
+        """
+        return httpx.Timeout(
+            connect=self._settings.a2a_connect_timeout,
+            read=self._settings.a2a_read_timeout,
+            write=self._settings.a2a_write_timeout,
+            pool=self._settings.a2a_pool_timeout,
+        )

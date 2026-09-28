@@ -16,13 +16,35 @@ export type {
   ReadOptions,
 } from "./client.js";
 
+// ── Pagination ─────────────────────────────────────────────────────
+
+export {
+  AsyncPaginationIterator,
+  createPaginationIterator,
+  PaginationAbortedError,
+  PaginationLimitExceededError,
+} from "./pagination.js";
+export type { AsyncPaginationIteratorOptions } from "./pagination.js";
+
 // ── Idempotency ───────────────────────────────────────────────────
 export {
   generateIdempotencyKey,
   validateIdempotencyKey,
   IdempotencyConflictError,
   isUuidV4,
+  isPayloadConflict,
   IDEMPOTENCY_KEY_MAX_BYTES,
+  // Client-side idempotency helpers
+  InMemoryIdempotencyStore,
+  createIdempotencyStore,
+  withIdempotency,
+  IdempotencyError,
+} from "./idempotency.js";
+export type {
+  IdempotencyRecord,
+  IdempotencyStore,
+  WithIdempotencyOptions,
+  IdempotencyErrorCode,
 } from "./idempotency.js";
 
 // ── Errors (typed hierarchy) ──────────────────────────────────────
@@ -84,6 +106,13 @@ export {
   TalosEventStream,
   TalosStreamError,
   InMemorySeenStore,
+  TALOS_EVENT_SCHEMA_VERSION,
+  SCHEMA_VERSION_REQUEST_HEADER,
+  SCHEMA_VERSION_RESPONSE_HEADER,
+  SchemaVersionMismatchError,
+  negotiateSchemaVersion,
+  SSE_MAX_FIELD_BYTES,
+  SSE_MAX_DATA_LINES,
 } from "./events.js";
 export type {
   TalosEventType,
@@ -93,6 +122,7 @@ export type {
   TalosStreamCloseHandler,
   TalosEventStreamOptions,
   SeenStore,
+  SchemaVersionNegotiationResult,
 } from "./events.js";
 
 // ── Contract event decoding ───────────────────────────────────────────────────
