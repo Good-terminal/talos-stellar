@@ -606,7 +606,10 @@ export class TalosEventStream {
   private async _readStream(body: ReadableStream<Uint8Array>): Promise<void> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
+    // Raw byte buffer — not yet normalised or split.
     let buffer = "";
+    // Strip the U+FEFF BOM only once, at the very start of the stream.
+    let bomStripped = false;
 
     // Current event being accumulated
     let eventId: string | undefined;
@@ -621,17 +624,97 @@ export class TalosEventStream {
         }
 
         const { done, value } = await reader.read();
-        if (done) return;
+        if (done) {
+          // Stream ended — flush any remaining buffer content as a final
+          // normalise+split pass.  A trailing \r that was held back (potential
+          // first half of \r\n) is now confirmed to be a bare \r terminator.
+          if (buffer.length > 0) {
+            const normalised = buffer
+              .replace(/\r\n/g, "\n")
+              .replace(/\r/g, "\n");
+            const lines = normalised.split("\n");
+            // The last element will be "" if the buffer ended with a newline;
+            // discard it (it is an implicit "no incomplete line" sentinel).
+            if (lines[lines.length - 1] === "") lines.pop();
+            for (const line of lines) {
+              if (line === "") {
+                if (dataLines.length > 0) {
+                  const data = dataLines.join("\n");
+                  const finalId = eventId;
+                  const finalType = eventType;
+                  if (finalId !== undefined) this.lastEventId = finalId;
+                  this.heartbeatMisses = 0;
+                  this._resetHeartbeatTimer();
+                  if (finalType !== "heartbeat") {
+                    const evt: TalosStreamEvent = {
+                      id: finalId,
+                      type: finalType,
+                      data,
+                      receivedAt: new Date(),
+                    };
+                    await this._dispatch(evt);
+                  }
+                }
+                eventId = undefined;
+                eventType = "message";
+                dataLines = [];
+              } else if (!line.startsWith(":")) {
+                const colonIdx = line.indexOf(":");
+                const field = colonIdx === -1 ? line : line.slice(0, colonIdx);
+                const val =
+                  colonIdx === -1
+                    ? ""
+                    : line.slice(colonIdx + 1).replace(/^ /, "");
+                if (field === "id") eventId = val;
+                else if (field === "event") eventType = val as TalosEventType;
+                else if (field === "data") dataLines.push(val);
+              }
+            }
+          }
+          return;
+        }
 
         buffer += decoder.decode(value, { stream: true });
 
-        const lines = buffer.split("\n");
-        // Keep the last (potentially incomplete) line in the buffer
-        buffer = lines.pop() ?? "";
+        // Strip the BOM (U+FEFF) once, at the very beginning of the stream.
+        // Per the WHATWG SSE spec, a BOM at position 0 must be ignored.
+        if (!bomStripped) {
+          bomStripped = true;
+          if (buffer.charCodeAt(0) === 0xfeff) {
+            buffer = buffer.slice(1);
+          }
+        }
 
-        for (const rawLine of lines) {
-          const line = rawLine.replace(/\r$/, "");
+        // The WHATWG SSE spec §9.2 recognises three line terminators: U+000D
+        // (\r), U+000A (\n), and U+000D U+000A (\r\n).  We must handle all
+        // three, including the case where a \r\n pair is split across two
+        // consecutive chunks (the \r arrives at the end of chunk N and the \n
+        // arrives at the start of chunk N+1).
+        //
+        // Strategy: if the buffer currently ends with a bare \r, hold it back
+        // until the next chunk tells us whether it is the first half of \r\n.
+        // Only normalise-and-split the portion before that trailing \r.
+        let toProcess: string;
+        if (buffer.endsWith("\r")) {
+          // Reserve the trailing \r — it may be the start of \r\n.
+          toProcess = buffer.slice(0, buffer.length - 1);
+          // buffer retains just the "\r"; toProcess gets the rest.
+          buffer = "\r";
+        } else {
+          toProcess = buffer;
+          buffer = "";
+        }
 
+        if (toProcess.length === 0) continue;
+
+        // Normalise \r\n and bare \r to \n, then split on \n.
+        const normalised = toProcess.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        const lines = normalised.split("\n");
+        // The last element may be an incomplete line (no trailing \n yet).
+        // Prepend any held-back \r so it re-joins cleanly with the next chunk.
+        buffer = (lines.pop() ?? "") + buffer;
+
+        for (const line of lines) {
           if (line === "") {
             // Blank line — dispatch the accumulated event
             if (dataLines.length > 0) {
