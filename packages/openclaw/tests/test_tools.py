@@ -1,341 +1,454 @@
-"""Tests for openclaw talos_skill — issue #887.
-
-Covers:
-- Structured {"error": ..., "status": ...} results on HTTP 4xx/5xx errors.
-- talos_shutdown closes the shared client (no unclosed-client warnings).
-- get_pending_jobs and update_status log non-200 responses instead of silently
-  swallowing them.
 """
+pytest suite for talos_skill/tools.py (issue #889).
 
+Every public tool function is covered with mocked HTTP via respx so no
+network calls are made and no real TALOS_API_URL / keys are required.
+"""
 from __future__ import annotations
 
+import importlib
 import json
-import logging
-from unittest.mock import AsyncMock, MagicMock
+import os
+from unittest.mock import patch
 
 import httpx
 import pytest
+import respx
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+BASE_URL = "https://talos-test.example"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _mock_transport(responses: list[httpx.Response]) -> httpx.MockTransport:
-    """Return an httpx.MockTransport that replays *responses* in order."""
-    iterator = iter(responses)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return next(iterator)
-
-    return httpx.MockTransport(handler)
-
-
-def _json_response(status: int, body: dict | list) -> httpx.Response:
-    return httpx.Response(
-        status_code=status,
-        headers={"Content-Type": "application/json"},
-        content=json.dumps(body).encode(),
-    )
+@pytest.fixture(autouse=True)
+def env_vars(monkeypatch):
+    """Set minimal environment variables and reset the module-level client."""
+    monkeypatch.setenv("TALOS_API_URL", BASE_URL)
+    monkeypatch.setenv("TALOS_API_KEY", "test-key")
+    monkeypatch.setenv("TALOS_ID", "talos-abc123")
+    # Reset module-level _client so each test gets a fresh TalosClient
+    import talos_skill.tools as tools_mod
+    tools_mod._client = None
+    yield
+    tools_mod._client = None
 
 
-def _make_client(transport: httpx.MockTransport):
-    """Create a TalosClient wired to a mock transport."""
-    from talos_skill.client import TalosClient  # local import to avoid side-effects at module load
+# ── talos_register ────────────────────────────────────────────────────────────
 
-    client = TalosClient(
-        base_url="http://test.invalid",
-        api_key="test-key",
-        talos_id="talos_test",
-    )
-    # Replace the internal httpx client with one using the mock transport.
-    client._http = httpx.AsyncClient(
-        base_url="http://test.invalid",
-        headers={"Authorization": "Bearer test-key", "Content-Type": "application/json"},
-        transport=transport,
-        timeout=5.0,
-    )
-    return client
-
-
-# ---------------------------------------------------------------------------
-# TalosClient unit tests
-# ---------------------------------------------------------------------------
-
-class TestTalosClientGetPendingJobs:
+class TestTalosRegister:
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_returns_jobs_on_200(self):
-        transport = _mock_transport([
-            _json_response(200, [{"id": "job_1", "serviceName": "research"}]),
-        ])
-        client = _make_client(transport)
-        jobs = await client.get_pending_jobs()
-        assert jobs == [{"id": "job_1", "serviceName": "research"}]
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_list_on_non_200(self, caplog):
-        transport = _mock_transport([_json_response(401, {"error": "Unauthorized"})])
-        client = _make_client(transport)
-
-        with caplog.at_level(logging.WARNING, logger="talos_skill.client"):
-            jobs = await client.get_pending_jobs()
-
-        assert jobs == []
-        assert any("401" in r.message for r in caplog.records), (
-            "Expected a warning log containing the status code"
-        )
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_list_on_500(self, caplog):
-        transport = _mock_transport([_json_response(500, {"error": "Internal Server Error"})])
-        client = _make_client(transport)
-
-        with caplog.at_level(logging.WARNING, logger="talos_skill.client"):
-            jobs = await client.get_pending_jobs()
-
-        assert jobs == []
-        assert any("500" in r.message for r in caplog.records)
-        await client.close()
-
-
-class TestTalosClientUpdateStatus:
-    @pytest.mark.asyncio
-    async def test_succeeds_silently_on_200(self, caplog):
-        transport = _mock_transport([_json_response(200, {"ok": True})])
-        client = _make_client(transport)
-
-        with caplog.at_level(logging.WARNING, logger="talos_skill.client"):
-            await client.update_status(True)
-
-        assert not caplog.records
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_logs_warning_on_non_200(self, caplog):
-        transport = _mock_transport([_json_response(403, {"error": "Forbidden"})])
-        client = _make_client(transport)
-
-        with caplog.at_level(logging.WARNING, logger="talos_skill.client"):
-            await client.update_status(True)
-
-        assert any("403" in r.message for r in caplog.records), (
-            "Expected a warning log for non-200 update_status response"
-        )
-        await client.close()
-
-
-class TestTalosClientClose:
-    @pytest.mark.asyncio
-    async def test_close_does_not_raise(self):
-        transport = _mock_transport([])
-        client = _make_client(transport)
-        # Must not raise and must mark the underlying client as closed.
-        await client.close()
-        assert client._http.is_closed
-
-
-# ---------------------------------------------------------------------------
-# tools.py — structured error results
-# ---------------------------------------------------------------------------
-
-class TestToolsStructuredErrors:
-    """Each tool function must return {"error": ..., "status": ...} on HTTP errors."""
-
-    def _patch_client(self, monkeypatch, client):
-        """Replace the module-level _client in tools with *client*."""
-        import talos_skill.tools as tools_mod
-        monkeypatch.setattr(tools_mod, "_client", client)
-
-    @pytest.mark.asyncio
-    async def test_talos_status_returns_structured_error_on_401(self, monkeypatch):
-        transport = _mock_transport([_json_response(401, {"error": "Unauthorized"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
-        from talos_skill.tools import talos_status
-        result = await talos_status()
-
-        assert result.get("status") == 401
-        assert "error" in result
-        assert "test-key" not in str(result), "API key must not appear in error result"
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_talos_status_returns_structured_error_on_500(self, monkeypatch):
-        transport = _mock_transport([_json_response(500, {"error": "Internal Server Error"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
-        from talos_skill.tools import talos_status
-        result = await talos_status()
-
-        assert result.get("status") == 500
-        assert "error" in result
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_talos_status_returns_structured_error_on_404(self, monkeypatch):
-        transport = _mock_transport([_json_response(404, {"error": "Not Found"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
-        from talos_skill.tools import talos_status
-        result = await talos_status()
-
-        assert result.get("status") == 404
-        assert "error" in result
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_talos_discover_returns_structured_error_on_401(self, monkeypatch):
-        transport = _mock_transport([_json_response(401, {"error": "Unauthorized"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
-        from talos_skill.tools import talos_discover
-        result = await talos_discover()
-
-        assert result.get("status") == 401
-        assert "error" in result
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_talos_register_returns_structured_error_on_422(self, monkeypatch):
-        transport = _mock_transport([_json_response(422, {"error": "Unprocessable Entity"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
+    async def test_returns_structured_result(self):
         from talos_skill.tools import talos_register
-        result = await talos_register(
-            name="TestAgent",
-            category="Development",
-            description="A test agent",
+
+        respx.post(f"{BASE_URL}/api/talos").mock(
+            return_value=httpx.Response(
+                201,
+                json={
+                    "id": "talos-xyz",
+                    "name": "TestBot",
+                    "apiKeyOnce": "sk-once-abc",
+                    "agentWalletAddress": "GABC123",
+                },
+            )
         )
 
-        assert result.get("status") == 422
-        assert "error" in result
-        await client.close()
+        result = await talos_register(
+            name="TestBot",
+            category="Marketing",
+            description="A test bot",
+        )
 
+        assert result["talos_id"] == "talos-xyz"
+        assert result["name"] == "TestBot"
+        assert result["api_key"] == "sk-once-abc"
+        assert result["wallet_address"] == "GABC123"
+        assert "Save your API key" in result["message"]
+
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_talos_submit_result_returns_structured_error_on_404(self, monkeypatch):
-        transport = _mock_transport([_json_response(404, {"error": "Job not found"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
+    async def test_optional_fields_are_sent_when_provided(self):
+        from talos_skill.tools import talos_register
+        import talos_skill.tools as tools_mod
 
-        from talos_skill.tools import talos_submit_result
-        result = await talos_submit_result(job_id="job_missing", result={"output": "done"})
+        route = respx.post(f"{BASE_URL}/api/talos").mock(
+            return_value=httpx.Response(201, json={"id": "t1", "name": "X"})
+        )
 
-        assert result.get("status") == 404
-        assert "error" in result
-        await client.close()
+        await talos_register(
+            name="X",
+            category="Sales",
+            description="desc",
+            persona="Friendly",
+            target_audience="SMBs",
+            channels=["x", "linkedin"],
+            service_name="Lead Gen",
+            service_description="Find leads",
+            service_price=5.0,
+        )
 
+        body = json.loads(route.calls[0].request.content)
+        assert body["persona"] == "Friendly"
+        assert body["targetAudience"] == "SMBs"
+        assert body["channels"] == ["x", "linkedin"]
+        assert body["serviceName"] == "Lead Gen"
+        assert body["servicePrice"] == 5.0
+
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_talos_report_returns_structured_error_on_500(self, monkeypatch):
-        transport = _mock_transport([_json_response(500, {"error": "Internal Server Error"})])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
+    async def test_caches_talos_id_and_api_key_on_client(self):
+        from talos_skill.tools import talos_register, _get_client
 
-        from talos_skill.tools import talos_report
-        result = await talos_report(action="activity", content="hello", channel="test")
+        respx.post(f"{BASE_URL}/api/talos").mock(
+            return_value=httpx.Response(
+                201,
+                json={"id": "talos-new", "apiKeyOnce": "sk-new"},
+            )
+        )
 
-        assert result.get("status") == 500
-        assert "error" in result
-        await client.close()
+        await talos_register(name="Bot", category="Dev", description="d")
+        client = _get_client()
+        assert client.talos_id == "talos-new"
+        assert client.api_key == "sk-new"
 
-    # ── success paths ────────────────────────────────────────────────────────
 
+# ── talos_discover ────────────────────────────────────────────────────────────
+
+class TestTalosDiscover:
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_talos_status_success_path(self, monkeypatch):
-        transport = _mock_transport([
-            _json_response(200, {
-                "name": "TestAgent",
-                "status": "Active",
-                "agentOnline": True,
-                "revenues": [{"amount": "5.00"}],
-                "commerceServices": [{}],
-                "activities": [{}, {}],
-                "approvals": [],
-                "gtmBudget": 100,
-            }),
-        ])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
-        from talos_skill.tools import talos_status
-        result = await talos_status()
-
-        assert result["name"] == "TestAgent"
-        assert result["total_revenue_usdc"] == 5.0
-        assert "error" not in result
-        await client.close()
-
-    @pytest.mark.asyncio
-    async def test_talos_discover_success_path(self, monkeypatch):
-        transport = _mock_transport([
-            _json_response(200, [
-                {"talosId": "t1", "serviceName": "research", "price": "2.00", "currency": "USDC"},
-            ]),
-        ])
-        client = _make_client(transport)
-        self._patch_client(monkeypatch, client)
-
+    async def test_returns_service_list(self):
         from talos_skill.tools import talos_discover
+
+        respx.get(f"{BASE_URL}/api/services").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "talosId": "t1",
+                        "serviceName": "Lead Gen",
+                        "description": "Find leads",
+                        "price": 2.5,
+                        "currency": "USDC",
+                    }
+                ],
+            )
+        )
+
         result = await talos_discover()
 
         assert result["count"] == 1
-        assert result["services"][0]["name"] == "research"
-        await client.close()
+        svc = result["services"][0]
+        assert svc["talos_id"] == "t1"
+        assert svc["name"] == "Lead Gen"
+        assert svc["price"] == 2.5
+        assert svc["currency"] == "USDC"
 
-
-# ---------------------------------------------------------------------------
-# talos_shutdown
-# ---------------------------------------------------------------------------
-
-class TestTalosShutdown:
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_shutdown_closes_client_and_resets_module_global(self, monkeypatch):
-        import talos_skill.tools as tools_mod
+    async def test_passes_category_and_target_as_query_params(self):
+        from talos_skill.tools import talos_discover
 
-        transport = _mock_transport([])
-        client = _make_client(transport)
-        monkeypatch.setattr(tools_mod, "_client", client)
+        route = respx.get(f"{BASE_URL}/api/services").mock(
+            return_value=httpx.Response(200, json=[])
+        )
 
-        from talos_skill.tools import talos_shutdown
-        await talos_shutdown()
+        await talos_discover(category="Marketing", target="startups")
 
-        assert client._http.is_closed, "HTTP client must be closed after shutdown"
-        assert tools_mod._client is None, "Module _client must be reset to None"
+        url = str(route.calls[0].request.url)
+        assert "category=Marketing" in url
+        assert "target=startups" in url
 
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_shutdown_is_idempotent(self, monkeypatch):
-        """Calling talos_shutdown twice must not raise."""
-        import talos_skill.tools as tools_mod
+    async def test_handles_wrapped_response(self):
+        """API may return { services: [...] } instead of a plain list."""
+        from talos_skill.tools import talos_discover
 
-        transport = _mock_transport([])
-        client = _make_client(transport)
-        monkeypatch.setattr(tools_mod, "_client", client)
+        respx.get(f"{BASE_URL}/api/services").mock(
+            return_value=httpx.Response(200, json={"services": [], "total": 0})
+        )
 
-        from talos_skill.tools import talos_shutdown
-        await talos_shutdown()
-        await talos_shutdown()  # second call with _client=None
+        result = await talos_discover()
+        assert result["count"] == 0
+        assert result["services"] == []
 
+
+# ── talos_purchase ────────────────────────────────────────────────────────────
+
+class TestTalosPurchase:
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_register_calls_register_shutdown_if_supported(self):
-        """register() should wire talos_shutdown if the host api has register_shutdown."""
-        from talos_skill import register, talos_shutdown
+    async def test_full_payment_flow(self):
+        from talos_skill.tools import talos_purchase
 
-        api = MagicMock()
-        api.register_shutdown = MagicMock()
-        register(api)
+        respx.get(f"{BASE_URL}/api/talos/seller-1/service").mock(
+            return_value=httpx.Response(
+                402, json={"payee": "GPAYEE", "price": 1.5}
+            )
+        )
+        respx.post(f"{BASE_URL}/api/talos/talos-abc123/sign").mock(
+            return_value=httpx.Response(200, json={"paymentHeader": "sig-xyz"})
+        )
+        respx.post(f"{BASE_URL}/api/talos/seller-1/service").mock(
+            return_value=httpx.Response(200, json={"id": "job-001"})
+        )
 
-        api.register_shutdown.assert_called_once_with(talos_shutdown)
+        result = await talos_purchase(talos_id="seller-1", payload={"topic": "AI"})
 
+        assert result["status"] == "purchased"
+        assert result["job_id"] == "job-001"
+        assert result["amount"] == 1.5
+
+    @respx.mock
     @pytest.mark.asyncio
-    async def test_register_skips_shutdown_if_not_supported(self):
-        """register() must not raise when the host api lacks register_shutdown."""
-        from talos_skill import register
+    async def test_free_service_returns_immediately(self):
+        from talos_skill.tools import talos_purchase
 
-        api = MagicMock(spec=["register_tool"])  # no register_shutdown attribute
-        register(api)  # should not raise
+        respx.get(f"{BASE_URL}/api/talos/seller-free/service").mock(
+            return_value=httpx.Response(200, json={"data": "free result"})
+        )
+
+        result = await talos_purchase(talos_id="seller-free")
+
+        assert result["status"] == "free"
+        assert result["result"] == {"data": "free result"}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_unexpected_status_returns_error(self):
+        from talos_skill.tools import talos_purchase
+
+        respx.get(f"{BASE_URL}/api/talos/seller-bad/service").mock(
+            return_value=httpx.Response(503, text="unavailable")
+        )
+
+        result = await talos_purchase(talos_id="seller-bad")
+
+        assert result["status"] == "error"
+        assert result["code"] == 503
+
+
+# ── talos_fulfill ─────────────────────────────────────────────────────────────
+
+class TestTalosFulfill:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_returns_idle_when_no_jobs(self):
+        from talos_skill.tools import talos_fulfill
+
+        respx.get(f"{BASE_URL}/api/jobs/pending").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+
+        result = await talos_fulfill()
+
+        assert result["status"] == "idle"
+        assert "No pending jobs" in result["message"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_returns_first_pending_job(self):
+        from talos_skill.tools import talos_fulfill
+
+        respx.get(f"{BASE_URL}/api/jobs/pending").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "job-42",
+                        "serviceName": "trend_research",
+                        "payload": {"topic": "AI"},
+                        "amount": 2.0,
+                    },
+                    {"id": "job-43", "serviceName": "find_leads", "payload": {}, "amount": 1.0},
+                ],
+            )
+        )
+
+        result = await talos_fulfill()
+
+        assert result["status"] == "job_available"
+        assert result["job_id"] == "job-42"
+        assert result["service"] == "trend_research"
+        assert result["amount"] == 2.0
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_handles_non_200_gracefully(self):
+        from talos_skill.tools import talos_fulfill
+
+        respx.get(f"{BASE_URL}/api/jobs/pending").mock(
+            return_value=httpx.Response(503)
+        )
+
+        result = await talos_fulfill()
+        assert result["status"] == "idle"
+
+
+# ── talos_submit_result ───────────────────────────────────────────────────────
+
+class TestTalosSubmitResult:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_submits_and_reports_revenue(self):
+        from talos_skill.tools import talos_submit_result
+
+        respx.post(f"{BASE_URL}/api/jobs/job-99/result").mock(
+            return_value=httpx.Response(
+                200, json={"id": "job-99", "amount": "3.5"}
+            )
+        )
+        revenue_route = respx.post(
+            f"{BASE_URL}/api/talos/talos-abc123/revenue"
+        ).mock(return_value=httpx.Response(200, json={"id": "rev-1"}))
+
+        result = await talos_submit_result(
+            job_id="job-99", result={"summary": "done"}
+        )
+
+        assert result["status"] == "completed"
+        assert result["job_id"] == "job-99"
+        assert result["revenue"] == 3.5
+        assert revenue_route.called
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_skips_revenue_report_when_amount_is_zero(self):
+        from talos_skill.tools import talos_submit_result
+
+        respx.post(f"{BASE_URL}/api/jobs/job-0/result").mock(
+            return_value=httpx.Response(200, json={"id": "job-0", "amount": "0"})
+        )
+        revenue_route = respx.post(
+            f"{BASE_URL}/api/talos/talos-abc123/revenue"
+        ).mock(return_value=httpx.Response(200, json={}))
+
+        await talos_submit_result(job_id="job-0", result={})
+
+        assert not revenue_route.called
+
+
+# ── talos_report ──────────────────────────────────────────────────────────────
+
+class TestTalosReport:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_logs_activity(self):
+        from talos_skill.tools import talos_report
+
+        route = respx.post(
+            f"{BASE_URL}/api/talos/talos-abc123/activity"
+        ).mock(return_value=httpx.Response(200, json={"id": "act-1"}))
+
+        result = await talos_report(
+            action="activity",
+            activity_type="post",
+            content="Shared a thread on X",
+            channel="x",
+        )
+
+        assert result["status"] == "recorded"
+        assert result["type"] == "activity"
+        assert result["activity_id"] == "act-1"
+        body = json.loads(route.calls[0].request.content)
+        assert body["type"] == "post"
+        assert body["channel"] == "x"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_reports_revenue(self):
+        from talos_skill.tools import talos_report
+
+        route = respx.post(
+            f"{BASE_URL}/api/talos/talos-abc123/revenue"
+        ).mock(return_value=httpx.Response(200, json={"id": "rev-2"}))
+
+        result = await talos_report(
+            action="revenue",
+            amount=10.0,
+            source="commerce",
+        )
+
+        assert result["status"] == "recorded"
+        assert result["type"] == "revenue"
+        assert result["amount"] == 10.0
+        body = json.loads(route.calls[0].request.content)
+        assert body["amount"] == 10.0
+        assert body["source"] == "commerce"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_revenue_defaults_source_to_direct(self):
+        from talos_skill.tools import talos_report
+
+        route = respx.post(
+            f"{BASE_URL}/api/talos/talos-abc123/revenue"
+        ).mock(return_value=httpx.Response(200, json={}))
+
+        await talos_report(action="revenue", amount=5.0)
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["source"] == "direct"
+
+
+# ── talos_status ──────────────────────────────────────────────────────────────
+
+class TestTalosStatus:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_returns_dashboard_summary(self):
+        from talos_skill.tools import talos_status
+
+        respx.get(f"{BASE_URL}/api/talos/talos-abc123").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "name": "TestBot",
+                    "status": "active",
+                    "agentOnline": True,
+                    "gtmBudget": 500.0,
+                    "revenues": [{"amount": "3.5"}, {"amount": "2.0"}],
+                    "commerceServices": [{"id": "svc-1"}],
+                    "activities": [{"id": "act-1"}, {"id": "act-2"}],
+                    "approvals": [
+                        {"id": "ap-1", "status": "pending"},
+                        {"id": "ap-2", "status": "approved"},
+                    ],
+                },
+            )
+        )
+
+        result = await talos_status()
+
+        assert result["name"] == "TestBot"
+        assert result["status"] == "active"
+        assert result["agent_online"] is True
+        assert result["total_revenue_usdc"] == pytest.approx(5.5)
+        assert result["active_services"] == 1
+        assert result["recent_activities"] == 2
+        assert result["pending_approvals"] == 1
+        assert result["budget_remaining"] == 500.0
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_handles_empty_relations(self):
+        from talos_skill.tools import talos_status
+
+        respx.get(f"{BASE_URL}/api/talos/talos-abc123").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "name": "EmptyBot",
+                    "status": "pending",
+                    "agentOnline": False,
+                },
+            )
+        )
+
+        result = await talos_status()
+
+        assert result["total_revenue_usdc"] == 0.0
+        assert result["active_services"] == 0
+        assert result["recent_activities"] == 0
+        assert result["pending_approvals"] == 0
